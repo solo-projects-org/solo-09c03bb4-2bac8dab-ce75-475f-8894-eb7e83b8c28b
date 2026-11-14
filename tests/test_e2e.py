@@ -13,11 +13,13 @@
 """
 from __future__ import annotations
 
+import io
 import os
 import socket
 import subprocess
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -75,7 +77,8 @@ def env_stack(tmp_path_factory):
     # 1) 生成虚构 CT
     gen = subprocess.run(
         [sys.executable, "-m", "simulator.generate_data",
-         "--out", str(pacs_data), "--counts", "6,5,4"],
+         "--out", str(pacs_data),
+         "--counts", "6,5,4,2"],
         cwd=ROOT, check=True, capture_output=True, text=True,
     )
     assert gen.returncode == 0
@@ -212,7 +215,7 @@ def test_01_health_and_pacs_listing(env_stack):
     r = requests.get(f"{env_stack['base']}/health", timeout=5)
     assert r.ok and r.json()["status"] == "ok"
     studies = _studies(env_stack)
-    assert len(studies) == 3
+    assert len(studies) == 4
     assert all(s["modality"] == "CT" for s in studies)
 
 
@@ -540,3 +543,190 @@ def test_09_restart_recovery(env_stack):
         assert dl.status_code == 200
     finally:
         pass
+
+
+# ------------------------------------------------ de-identification package
+def _dicom_members(content: bytes):
+    import io, zipfile
+    import pydicom
+    zf = zipfile.ZipFile(io.BytesIO(content))
+    out = []
+    for name in sorted(n for n in zf.namelist() if n.startswith("dicom/")):
+        out.append((name, pydicom.dcmread(io.BytesIO(zf.read(name)))))
+    return zf, out
+
+
+def test_10_deid_package_end_to_end(env_stack):
+    """原 ZIP -> 去标识新包：标签删除、UID 换新、引用改写、清单、原包不变。"""
+    studies = _studies(env_stack)
+    study = studies[0]["study_instance_uid"]
+    r = requests.post(f"{env_stack['base']}/batches",
+                      json={"study_instance_uid": study}, timeout=10)
+    assert r.status_code == 201
+    bid = r.json()["id"]
+    view = _wait_terminal(env_stack, bid)
+    assert view["state"] == "COMPLETED"
+
+    original = requests.get(
+        f"{env_stack['base']}/batches/{bid}/download", timeout=20).content
+    _zf, original_members = _dicom_members(original)
+    original_ds = [d for _, d in original_members]
+    old_sops = {str(d.SOPInstanceUID) for d in original_ds}
+    old_study = str(original_ds[0].StudyInstanceUID)
+    old_patient = str(original_ds[0].PatientID)
+
+    created = requests.post(
+        f"{env_stack['base']}/batches/{bid}/deid-package", timeout=60)
+    assert created.status_code == 201, created.text
+    payload = created.json()
+    assert payload["state"] == "COMPLETED"
+    assert payload["downloadable"] is True
+    assert payload["new_study_instance_uid"] != old_study
+    assert payload["new_patient_id"] != old_patient
+    assert payload["instance_count"] == view["expected_count"]
+
+    # 幂等：重复生成返回同一份包（200），不产生第二份
+    again = requests.post(
+        f"{env_stack['base']}/batches/{bid}/deid-package", timeout=60)
+    assert again.status_code == 200
+    assert again.json()["new_study_instance_uid"] == payload["new_study_instance_uid"]
+    assert again.json()["attempt"] == payload["attempt"] == 1
+
+    dl = requests.get(
+        f"{env_stack['base']}/batches/{bid}/deid-download", timeout=30)
+    assert dl.status_code == 200
+    zf, deid_members = _dicom_members(dl.content)
+    deid_ds = [d for _, d in deid_members]
+    with zf:
+        assert "MANIFEST.csv" in zf.namelist()
+        manifest = zf.read("MANIFEST.csv").decode().strip().splitlines()
+    assert len(manifest) == view["expected_count"] + 1
+    assert len(deid_ds) == view["expected_count"]
+
+    new_sops = {str(d.SOPInstanceUID) for d in deid_ds}
+    assert len(new_sops) == view["expected_count"]
+    assert not (new_sops & old_sops)
+    for name, ds in deid_members:
+        assert "PatientName" not in ds
+        assert "PatientBirthDate" not in ds
+        assert "AccessionNumber" not in ds
+        assert not any(e.tag.is_private for e in ds)  # 顶层私有块已删
+        assert str(ds.PatientID) == payload["new_patient_id"]
+        assert str(ds.StudyInstanceUID) == payload["new_study_instance_uid"]
+        assert str(ds.file_meta.MediaStorageSOPInstanceUID) == str(ds.SOPInstanceUID)
+        # 文件中不再出现任何原始标识字符串
+        raw_no_pixels = str(ds)
+        assert "PHANTOM" not in raw_no_pixels
+        assert "SYNTH_PRIV" not in raw_no_pixels
+        for old in old_sops:
+            assert old not in raw_no_pixels
+        # 序列内引用指向本批新 SOP
+        for item in ds.ReferencedImageSequence:
+            assert str(item.ReferencedSOPInstanceUID) in new_sops
+        # 行数不得为原始文件名 / 旧 UID
+        assert old_study not in name
+        for old in old_sops:
+            assert old not in name
+
+    # 文件名、清单与包内实际新 SOP 一致
+    manifest_sops = {line.split(",")[0] for line in manifest[1:]}
+    assert manifest_sops == new_sops
+
+    # 原包仍可下载且未被改写
+    original_again = requests.get(
+        f"{env_stack['base']}/batches/{bid}/download", timeout=20).content
+    assert original_again == original
+
+
+def test_12_concurrent_http_generation_publishes_one_package(env_stack):
+    """同批并发 HTTP 生成：只发布一份完整新包，所有请求得到同一结果。"""
+    import threading
+
+    studies = _studies(env_stack)
+    study = studies[1]["study_instance_uid"]
+    r = requests.post(f"{env_stack['base']}/batches",
+                      json={"study_instance_uid": study}, timeout=10)
+    assert r.status_code == 201
+    bid = r.json()["id"]
+    view = _wait_terminal(env_stack, bid)
+    assert view["state"] == "COMPLETED"
+
+    results: list = []
+    lock = threading.Lock()
+
+    def _post() -> None:
+        resp = requests.post(
+            f"{env_stack['base']}/batches/{bid}/deid-package", timeout=120)
+        with lock:
+            results.append(resp)
+
+    threads = [threading.Thread(target=_post) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+
+    assert len(results) == 6
+    codes = [r.status_code for r in results]
+    assert all(code in (200, 201) for code in codes), codes
+    assert codes.count(201) == 1, codes
+    payloads = [r.json() for r in results]
+    assert len({p["new_study_instance_uid"] for p in payloads}) == 1
+    assert len({p["new_patient_id"] for p in payloads}) == 1
+    assert all(p["attempt"] == 1 for p in payloads)
+
+    # 服务端只保留一份包文件，且无临时残留
+    zips = list((env_stack["api_data"] / "zips").glob(f"{bid}.deid.zip"))
+    assert len(zips) == 1
+    assert not list((env_stack["api_data"] / "zips").glob("*.deid.zip.part"))
+
+    dl = requests.get(
+        f"{env_stack['base']}/batches/{bid}/deid-download", timeout=30)
+    assert dl.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+        assert len([n for n in zf.namelist() if n.startswith("dicom/")]) == \
+            view["expected_count"]
+
+
+def test_11_deid_external_reference_is_rejected_and_below_completed_is_409(
+    env_stack,
+):
+    studies = _studies(env_stack)
+    external = next(
+        s for s in studies if any(
+            "777001" in s["study_instance_uid"] for _ in [0]))
+    study = external["study_instance_uid"]
+    r = requests.post(f"{env_stack['base']}/batches",
+                      json={"study_instance_uid": study}, timeout=10)
+    assert r.status_code == 201
+    bid = r.json()["id"]
+    view = _wait_terminal(env_stack, bid)
+    assert view["state"] == "COMPLETED"
+
+    resp = requests.post(
+        f"{env_stack['base']}/batches/{bid}/deid-package", timeout=60)
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert "本批之外" in detail["message"]
+    assert "777002" in detail["message"] or "ReferencedSOPInstanceUID" in detail["message"]
+    assert detail["retryable"] is True
+
+    # 状态查询显示 FAILED 与原因；下载被拒绝且不暴露任何包
+    status = requests.get(
+        f"{env_stack['base']}/batches/{bid}/deid-package", timeout=5).json()
+    assert status["state"] == "FAILED"
+    assert status["downloadable"] is False
+    assert "本批之外" in status["error"]
+    dl = requests.get(
+        f"{env_stack['base']}/batches/{bid}/deid-download", timeout=5)
+    assert dl.status_code == 409
+
+    # 未完成的批不允许发布去标识包
+    r2 = requests.post(f"{env_stack['base']}/batches",
+                       json={"study_instance_uid": study}, timeout=10)
+    if r2.status_code == 201:
+        pending = r2.json()["id"]
+        resp2 = requests.post(
+            f"{env_stack['base']}/batches/{pending}/deid-package", timeout=10)
+        assert resp2.status_code in (409, 422)
+        _wait_terminal(env_stack, pending)

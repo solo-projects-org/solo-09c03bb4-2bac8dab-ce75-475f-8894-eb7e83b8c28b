@@ -34,6 +34,14 @@ class Settings:
     BATCHES_DIR: Path = DATA_DIR / "batches"
     ZIP_DIR: Path = DATA_DIR / "zips"
 
+    # ---- 定向去标识包 ----
+    # 重新分配 UID 时使用固定根；保证同批重试生成完全一致的新 UID。
+    ANON_UID_ROOT: str = os.getenv(
+        "ANON_UID_ROOT", "1.2.826.0.1.3680043.10.999"
+    )
+    # 新 PatientID 前缀（后接由批 ID 派生的稳定摘要）
+    ANON_PATIENT_PREFIX: str = os.getenv("ANON_PATIENT_PREFIX", "ANON")
+
     @classmethod
     def ensure_dirs(cls) -> None:
         cls.DATA_DIR.mkdir(parents=True, exist_ok=True)

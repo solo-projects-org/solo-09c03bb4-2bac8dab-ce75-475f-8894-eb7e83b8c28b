@@ -27,6 +27,11 @@ STATE_FAILED = "FAILED"          # 终态失败（FIND/MOVE/保存/重启中断/
 
 TERMINAL_STATES = {STATE_COMPLETED, STATE_FAILED}
 
+# ---- 去标识包状态（同批并发生成只允许一个发布者）----
+DEID_RUNNING = "RUNNING"         # 已领取生成权，正在读原包/改写/写盘
+DEID_COMPLETED = "COMPLETED"     # 新包已原子发布，可下载
+DEID_FAILED = "FAILED"           # 失败（含批外引用/写盘失败/重启中断），可重试
+
 # 进程级单例（main 启动时注入），供 storage 等模块反向访问
 _DB_SINGLETON: "Database | None" = None
 
@@ -99,6 +104,31 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_batch
                     ON events(batch_id, id);
+
+                -- 去标识包：每批最多一份。RUNNING 期间其他请求不得并发写盘；
+                -- COMPLETED 后 zip_path 指向原子发布的新包；FAILED 允许重试。
+                CREATE TABLE IF NOT EXISTS deid_packages (
+                    batch_id      TEXT PRIMARY KEY
+                        REFERENCES batches(id) ON DELETE CASCADE,
+                    state         TEXT NOT NULL,
+                    zip_path      TEXT,
+                    attempt       INTEGER NOT NULL DEFAULT 0,
+                    error         TEXT,
+                    study_uid     TEXT,
+                    patient_id    TEXT,
+                    created_at    TEXT NOT NULL,
+                    updated_at    TEXT NOT NULL
+                );
+
+                -- 旧 SOP -> 新 SOP 的稳定映射（用于重试一致性校验与清单）
+                CREATE TABLE IF NOT EXISTS deid_instances (
+                    batch_id           TEXT NOT NULL
+                        REFERENCES batches(id) ON DELETE CASCADE,
+                    original_sop_uid   TEXT NOT NULL,
+                    new_sop_uid        TEXT NOT NULL,
+                    file_name          TEXT NOT NULL,
+                    PRIMARY KEY (batch_id, original_sop_uid)
+                );
                 """
             )
 
@@ -349,3 +379,126 @@ class Database:
                 "SELECT * FROM batches WHERE state = ?", (STATE_COMPLETED,)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------ deid packages
+    def get_deid(self, batch_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM deid_packages WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def claim_deid(self, batch_id: str) -> bool:
+        """原子领取去标识生成权。
+
+        只有不存在记录、或上次为 FAILED 时才允许领取；领取即写入 RUNNING，
+        从而同批并发生成只有一个发布者。COMPLETED 与 RUNNING 均拒绝领取。
+
+        用 ``INSERT ... ON CONFLICT DO UPDATE ... WHERE state='FAILED'`` 让
+        “检查 + 写入”在单条 SQL 内完成：即使未来以多个 worker 进程共享
+        同一个 SQLite（WAL）运行，也只有一个进程能领取成功。
+        """
+        now = _now()
+        with self._lock, self._conn:
+            before = self._conn.total_changes
+            self._conn.execute(
+                "INSERT INTO deid_packages(batch_id, state, attempt, "
+                "created_at, updated_at) VALUES (?, ?, 1, ?, ?) "
+                "ON CONFLICT(batch_id) DO UPDATE SET "
+                "  state = excluded.state, "
+                "  error = NULL, "
+                "  attempt = deid_packages.attempt + 1, "
+                "  updated_at = excluded.updated_at "
+                "WHERE deid_packages.state = ?",
+                (batch_id, DEID_RUNNING, now, now, DEID_FAILED),
+            )
+            return self._conn.total_changes > before
+
+    def complete_deid(
+        self,
+        batch_id: str,
+        zip_path: str,
+        *,
+        study_uid: str,
+        patient_id: str,
+        instances: list[tuple[str, str, str]],
+    ) -> bool:
+        """登记去标识结果：SOP 映射与新包路径在同一事务内落定。"""
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT state FROM deid_packages WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+            if row is None or row["state"] != DEID_RUNNING:
+                return False
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO deid_instances(batch_id, original_sop_uid, "
+                "new_sop_uid, file_name) VALUES (?, ?, ?, ?)",
+                [(batch_id, old, new, name) for old, new, name in instances],
+            )
+            self._conn.execute(
+                "UPDATE deid_packages SET state = ?, zip_path = ?, study_uid = ?, "
+                "patient_id = ?, error = NULL, updated_at = ? WHERE batch_id = ?",
+                (DEID_COMPLETED, zip_path, study_uid, patient_id, _now(), batch_id),
+            )
+        return True
+
+    def fail_deid(self, batch_id: str, reason: str) -> bool:
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT state FROM deid_packages WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+            if row is None or row["state"] != DEID_RUNNING:
+                return False
+            self._conn.execute(
+                "UPDATE deid_packages SET state = ?, error = ?, updated_at = ? "
+                "WHERE batch_id = ?",
+                (DEID_FAILED, reason, _now(), batch_id),
+            )
+        return True
+
+    def deid_instances(self, batch_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT original_sop_uid, new_sop_uid, file_name "
+                "FROM deid_instances WHERE batch_id = ? ORDER BY original_sop_uid",
+                (batch_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def all_deid_packages(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM deid_packages ORDER BY rowid"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def recover_deid_running(self, reason: str) -> list[str]:
+        """启动恢复：把上次进程遗留的 RUNNING 一律置 FAILED（可重试）。"""
+        with self._lock, self._conn:
+            rows = self._conn.execute(
+                "SELECT batch_id FROM deid_packages WHERE state = ?",
+                (DEID_RUNNING,),
+            ).fetchall()
+            ids = [r["batch_id"] for r in rows]
+            if ids:
+                self._conn.executemany(
+                    "UPDATE deid_packages SET state = ?, error = ?, updated_at = ? "
+                    "WHERE batch_id = ?",
+                    [(DEID_FAILED, reason, _now(), bid) for bid in ids],
+                )
+        return ids
+
+    def invalidate_deid_package(self, batch_id: str, reason: str) -> bool:
+        """已发布包文件丢失时置 FAILED（允许重新生成）。"""
+        with self._lock, self._conn:
+            row = self._conn.execute(
+                "SELECT state FROM deid_packages WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+            if row is None or row["state"] != DEID_COMPLETED:
+                return False
+            self._conn.execute(
+                "UPDATE deid_packages SET state = ?, zip_path = NULL, error = ?, "
+                "updated_at = ? WHERE batch_id = ?",
+                (DEID_FAILED, reason, _now(), batch_id),
+            )
+        return True

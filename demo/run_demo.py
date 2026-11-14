@@ -59,6 +59,134 @@ def show_events(batch_id: str) -> None:
         print(f"    [{e['created_at'][11:]}] {e['kind']}: {e['message']}")
 
 
+def _create_batch(study_uid: str) -> str:
+    r = requests.post(f"{API}/batches",
+                      json={"study_instance_uid": study_uid}, timeout=10)
+    r.raise_for_status()
+    return r.json()["id"]
+
+
+def demo_deid_package(study_uid: str, view: dict) -> None:
+    """完整走一遍：已有完成批 -> 生成去标识包 -> 校验 -> 下载。"""
+    if view["state"] != "COMPLETED":
+        print("    批 A 未完成，跳过去标识演示")
+        return
+    import pydicom
+
+    bid = view["id"]
+    original = requests.get(f"{API}/batches/{bid}/download", timeout=30).content
+    old_zf = zipfile.ZipFile(io.BytesIO(original))
+    old_sops = {
+        str(pydicom.dcmread(io.BytesIO(old_zf.read(n))).SOPInstanceUID)
+        for n in old_zf.namelist() if n.startswith("dicom/")
+    }
+
+    # 同批并发生成：只发布一份完整新包，所有请求得到同一结果
+    import threading
+    responses: list = []
+    lock = threading.Lock()
+
+    def _post() -> None:
+        r = requests.post(f"{API}/batches/{bid}/deid-package", timeout=120)
+        with lock:
+            responses.append(r)
+
+    threads = [threading.Thread(target=_post) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=120)
+    codes = [r.status_code for r in responses]
+    print(f"    并发 4 个生成请求 -> HTTP={codes}")
+    assert all(c in (200, 201) for c in codes), codes
+    assert sum(c == 201 for c in codes) == 1, codes
+    assert len({r.json()["new_study_instance_uid"] for r in responses}) == 1
+    resp = next(r for r in responses if r.status_code == 201)
+    print("    只发布一份完整新包：首次 201，其余 200 复用同一包")
+    payload = resp.json()
+    print(f"    新 StudyInstanceUID={payload['new_study_instance_uid']}")
+    print(f"    新 PatientID={payload['new_patient_id']}")
+    print(f"    实例数={payload['instance_count']}，attempt={payload['attempt']}")
+
+    # 幂等重试：同一份包，同一批 UID
+    again = requests.post(f"{API}/batches/{bid}/deid-package", timeout=120)
+    print(f"    重复生成 HTTP={again.status_code}（期望 200，复用同一完整包）")
+    assert again.status_code == 200
+    assert again.json()["new_study_instance_uid"] == payload["new_study_instance_uid"]
+
+    dl = requests.get(f"{API}/batches/{bid}/deid-download", timeout=30)
+    dl.raise_for_status()
+    new_zf = zipfile.ZipFile(io.BytesIO(dl.content))
+    names = [n for n in new_zf.namelist() if n.startswith("dicom/")]
+    manifest = new_zf.read("MANIFEST.csv").decode().strip().splitlines()
+    print(f"    新包 DICOM 文件数={len(names)}，MANIFEST 行数（含表头）={len(manifest)}")
+    assert len(names) == view["expected_count"]
+    assert len(manifest) == view["expected_count"] + 1
+
+    new_sops = set()
+    for name in names:
+        ds = pydicom.dcmread(io.BytesIO(new_zf.read(name)))
+        new_sops.add(str(ds.SOPInstanceUID))
+        assert "PatientName" not in ds, "PatientName 未删除"
+        assert "PatientBirthDate" not in ds, "PatientBirthDate 未删除"
+        assert "AccessionNumber" not in ds, "AccessionNumber 未删除"
+        assert not any(e.tag.is_private for e in ds), "残留私有标签"
+        assert str(ds.StudyInstanceUID) == payload["new_study_instance_uid"]
+        assert str(ds.file_meta.MediaStorageSOPInstanceUID) == str(ds.SOPInstanceUID)
+        refs = [str(i.ReferencedSOPInstanceUID)
+                for i in ds.ReferencedImageSequence]
+        assert refs, "序列内引用丢失"
+        for ref in refs:
+            # 引用已与本批新 SOP 同步（处于同一映射代）
+            assert ref not in old_sops, f"引用仍是旧 SOP：{ref}"
+        # 文件名只含新 UID
+        assert all(old not in name for old in old_sops), name
+    assert not (new_sops & old_sops), "新 SOP 不得等于旧 SOP"
+
+    # 文件名清单与包内一致
+    manifest_sops = {line.split(",")[0] for line in manifest[1:]}
+    assert manifest_sops == new_sops
+    print("    校验通过：直接标识已删、私有标签递归清除、UID 换新、"
+          "引用/文件名/清单同步改写")
+
+    original_again = requests.get(
+        f"{API}/batches/{bid}/download", timeout=30)
+    print(f"    原包仍可下载 HTTP={original_again.status_code}（期望 200）")
+    assert original_again.status_code == 200
+    assert original_again.content == original, "原包被改写"
+    print("    原包内容未受影响")
+
+
+def demo_rejected_package(studies: list[dict]) -> None:
+    """含批外引用的检查：去标识必须拒绝发布并给出原因。"""
+    external = next(
+        (s for s in studies
+         if "777001" in s["study_instance_uid"]), None)
+    if external is None:
+        print("    演示数据中没有批外引用检查（第 4 个 Study），跳过")
+        return
+    bid = _create_batch(external["study_instance_uid"])
+    view = wait_state(bid, {"COMPLETED", "FAILED"})
+    print(f"    原批状态={view['state']} {view['received_count']}/"
+          f"{view['expected_count']}")
+    if view["state"] != "COMPLETED":
+        print("    原批未完成，跳过去标识拒绝演示")
+        return
+    resp = requests.post(f"{API}/batches/{bid}/deid-package", timeout=120)
+    print(f"    生成去标识包 HTTP={resp.status_code}（期望 422）")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    print(f"    拒绝原因：{detail['message']}")
+    assert "本批之外" in detail["message"]
+
+    status = requests.get(f"{API}/batches/{bid}/deid-package", timeout=10).json()
+    print(f"    状态={status['state']}，error={status['error']}")
+    dl = requests.get(f"{API}/batches/{bid}/deid-download", timeout=10)
+    print(f"    去标识包下载 HTTP={dl.status_code}（期望 409，不暴露任何包）")
+    assert dl.status_code == 409
+    show_events(bid)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-restart", action="store_true",
@@ -127,6 +255,7 @@ def main() -> int:
     print(f"    批 B 终态={view_b['state']} "
           f"{view_b['received_count']}/{view_b['expected_count']}")
     print(f"    批 C 终态={view_c['state']} 原因={view_c['failure_reason']}")
+    view_a["id"] = batch_a
 
     print("\n  -- 批 A 事件流水（可见重复投送去重、rogue 拒收）--")
     show_events(batch_a)
@@ -152,6 +281,12 @@ def main() -> int:
     denied = requests.get(f"{API}/batches/{batch_c}/download", timeout=10)
     print(f"    失败批 C 下载 HTTP 状态={denied.status_code}（期望 409）")
     assert denied.status_code == 409
+
+    banner("6b. 定向去标识包：生成、校验、下载（原包保持可下载）")
+    demo_deid_package(study_a, view_a)
+
+    banner("6c. 批外引用：拒绝发布并说明原因")
+    demo_rejected_package(studies)
 
     if args.skip_restart:
         banner("演示完成（已跳过重启恢复）")

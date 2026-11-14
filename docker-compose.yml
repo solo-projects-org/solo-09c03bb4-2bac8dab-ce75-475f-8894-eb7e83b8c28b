@@ -20,6 +20,9 @@ services:
       ACSE_TIMEOUT: "30"
       DIMSE_TIMEOUT: "300"
       NETWORK_TIMEOUT: "300"
+      # 定向去标识新 UID 根与新 PatientID 前缀（同批重试结果稳定）
+      ANON_UID_ROOT: "1.2.826.0.1.3680043.10.999"
+      ANON_PATIENT_PREFIX: "ANON"
     ports:
       - "8000:8000"     # Swagger / REST
       - "11113:11113"   # DICOM C-STORE SCP
@@ -51,7 +54,7 @@ services:
       MOVE_DELAY: "1.0"
       # 每 3 个实例重复投送一次，验证接收端去重
       MOVE_DUPLICATE_EVERY: "3"
-      STUDY_COUNTS: "8,6,5"
+      STUDY_COUNTS: "8,6,5,2"
     ports:
       - "11112:11112"
     volumes:
